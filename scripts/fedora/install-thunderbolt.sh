@@ -186,7 +186,23 @@ else
 		fail "thunderbolt source tree was not found"
 fi
 
+stream_enabled=0
+[[ -r "$build_tree/.config" ]] || fail "kernel configuration is missing for $KVER"
+if grep -qx 'CONFIG_USB4_STREAM=y' "$build_tree/.config"; then
+	fail "USB4STREAM is built into $KVER; use a kernel with CONFIG_USB4_STREAM=m to install the stream fixes"
+elif grep -qx 'CONFIG_USB4_STREAM=m' "$build_tree/.config"; then
+	stream_enabled=1
+	[[ -f "$kernel_tree/drivers/thunderbolt/stream.c" ]] ||
+		fail "USB4STREAM source is missing for $KVER"
+else
+	info "USB4STREAM is disabled in $KVER; installing the core driver only"
+fi
+
 for patch_file in "${PATCH_FILES[@]}"; do
+	if [[ ${patch_file##*/} == 0002-thunderbolt-stream-preserve-session-integrity.patch ]] &&
+		((stream_enabled == 0)); then
+		continue
+	fi
 	apply_patch_if_needed "$kernel_tree" "$patch_file"
 done
 
@@ -195,16 +211,22 @@ info "building thunderbolt for $KVER"
 make -j "$(nproc)" -C "$build_tree" M="$tb_dir" modules
 
 staging="$workdir/modules"
-module="$tb_dir/thunderbolt.ko"
-[[ -f "$module" ]] || fail "thunderbolt.ko was not built"
-install -Dpm 0644 "$module" "$staging/thunderbolt.ko"
-strip --strip-debug "$staging/thunderbolt.ko" ||
-	warn "could not strip debug info, installing a larger, unstripped thunderbolt.ko"
-xz --check=crc32 --lzma2=dict=1MiB -f "$staging/thunderbolt.ko"
+module_names=(thunderbolt)
+((stream_enabled == 0)) || module_names+=(thunderbolt_stream)
+for name in "${module_names[@]}"; do
+	module="$tb_dir/$name.ko"
+	[[ -f "$module" ]] || fail "$name.ko was not built"
+	install -Dpm 0644 "$module" "$staging/$name.ko"
+	strip --strip-debug "$staging/$name.ko" ||
+		warn "could not strip debug info, installing a larger, unstripped $name.ko"
+	xz --check=crc32 --lzma2=dict=1MiB -f "$staging/$name.ko"
+done
 
 info "installing patched thunderbolt module for $KVER"
 install -d -m 0755 "$MODULE_DIR"
-install -m 0644 "$staging/thunderbolt.ko.xz" "$MODULE_DIR/"
+for name in "${module_names[@]}"; do
+	install -m 0644 "$staging/$name.ko.xz" "$MODULE_DIR/"
+done
 depmod -a "$KVER"
 if ((DEFER_INITRAMFS == 0)); then
 	dracut --force "/boot/initramfs-$KVER.img" "$KVER"
@@ -212,3 +234,6 @@ fi
 
 info "patched thunderbolt module installed for $KVER"
 info "reboot into $KVER, then verify with: modinfo -n thunderbolt"
+if ((stream_enabled)); then
+	info "verify the stream module too: modinfo -n thunderbolt_stream"
+fi

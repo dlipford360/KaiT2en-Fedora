@@ -1,0 +1,344 @@
+Subject: [PATCH] thunderbolt: stream: preserve session integrity
+
+Based on Linux v7.3.3. Keep mandatory E2E flow control, report RX errors,
+process CLOSE for write-only users and wait for a TX slot in interrupt
+mode. Stop disconnected sessions before releasing HopIDs and require all
+old handles to close before reuse. Refuse system sleep while streams are
+open because USB4STREAM cannot replay data discarded by ring teardown.
+
+The RX error and CLOSE handling follow the fixes in upstream stream.c;
+the session and suspend policy is a downstream conservative fix.
+
+---
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -132,6 +132,8 @@
+  * @throttling: Interrupt throttling rate in ns
+  * @busy_poll: Instead of interrupts, busy poll the rings
+  * @users: Number of times @cdev has been opened
++ * @disconnected: Open handles belong to a disconnected session
++ * @close_received: Peer CLOSE received, including for write-only users
+  * @closed: CLOSE packet was received
+  * @removed: Userspace removed the ConfigFS group underneath.
+  * @wait: Waitqueue for open, read and write
+@@ -152,6 +154,8 @@
+ 	unsigned int throttling;
+ 	bool busy_poll;
+ 	int users;
++	bool disconnected;
++	bool close_received;
+ 	bool closed;
+ 	bool removed;
+ 	wait_queue_head_t wait;
+@@ -326,6 +330,8 @@
+ {
+ 	const struct tbstream *stream = sdev->stream;
+ 
++	if (READ_ONCE(sdev->disconnected))
++		return -ENXIO;
+ 	if (!tbstream_valid(stream))
+ 		return -ENXIO;
+ 	if (sdev->in_hopid <= 0 || sdev->out_hopid <= 0)
+@@ -340,7 +346,12 @@
+ 
+ static inline bool tbstream_dev_closed(const struct tbstream_dev *sdev)
+ {
+-	return sdev->closed;
++	return READ_ONCE(sdev->closed);
++}
++
++static inline bool tbstream_dev_close_received(const struct tbstream_dev *sdev)
++{
++	return READ_ONCE(sdev->close_received);
+ }
+ 
+ static void
+@@ -356,12 +367,12 @@
+ 	sf->completed = true;
+ 	sdev->rx_ring.prod++;
+ 
+-	if (sf->frame.flags & RING_DESC_CRC_ERROR)
+-		pr_warn("RX CRC error\n");
+-	else if (sf->frame.flags & RING_DESC_BUFFER_OVERRUN)
+-		pr_warn("RX buffer overrun\n");
+-	else
+-		wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM);
++	if (sf->frame.eof == TBSTREAM_CLOSE)
++		WRITE_ONCE(sdev->close_received, true);
++
++	/* Errors must wake readers too; read_iter() reports them as EIO. */
++	wake_up_interruptible_poll(&sdev->wait, EPOLLIN | EPOLLRDNORM |
++		(tbstream_dev_close_received(sdev) ? EPOLLHUP : 0));
+ }
+ 
+ static struct tbstream_frame *
+@@ -543,7 +554,7 @@
+ {
+ 	struct ring_frame *frame;
+ 
+-	if (!sdev->busy_poll)
++	if (!sdev->busy_poll || !ring->ring)
+ 		return;
+ 
+ 	while ((frame = tb_ring_poll(ring->ring)))
+@@ -553,23 +564,15 @@
+ static int tbstream_dev_send_close(struct tbstream_dev *sdev)
+ {
+ 	struct tbstream_frame *sf;
+-
+-	if (sdev->busy_poll) {
+-		/*
+-		 * When busy polling it's the write(2) path that
+-		 * advances the completions so it is possible that the
+-		 * ring is full at this point. Advance the ring here so
+-		 * that there is room for the CLOSE packet to be sent.
+-		 */
+-		ktime_t timeout = ktime_add_ms(ktime_get(), 500);
+-
+-		do {
+-			if (tbstream_ring_available(&sdev->tx_ring))
+-				break;
+-			tbstream_dev_poll_ring(sdev, &sdev->tx_ring);
+-			fsleep(15);
+-		} while (ktime_before(ktime_get(), timeout));
+-	}
++	ktime_t timeout = ktime_add_ms(ktime_get(), 500);
++
++	/* Interrupt-driven rings can be full at close time as well. */
++	do {
++		if (tbstream_ring_available(&sdev->tx_ring))
++			break;
++		tbstream_dev_poll_ring(sdev, &sdev->tx_ring);
++		fsleep(15);
++	} while (ktime_before(ktime_get(), timeout));
+ 
+ 	sf = tbstream_dev_alloc_tx(sdev, TBSTREAM_CLOSE, NULL, SZ_256);
+ 	if (IS_ERR(sf))
+@@ -593,6 +596,12 @@
+ 		return -ENOMEM;
+ 	sdev->tx_ring.ring = ring;
+ 
++	/* USB4STREAM has no software fallback for missing E2E credits. */
++	if (!(ring->flags & RING_FLAG_E2E)) {
++		ret = -EOPNOTSUPP;
++		goto err_free_tx;
++	}
++
+ 	ret = tbstream_dev_alloc_tx_buffers(sdev);
+ 	if (ret)
+ 		goto err_free_tx;
+@@ -608,6 +617,11 @@
+ 		goto err_free_tx_buffers;
+ 	}
+ 	sdev->rx_ring.ring = ring;
++
++	if (!(ring->flags & RING_FLAG_E2E)) {
++		ret = -EOPNOTSUPP;
++		goto err_free_rx;
++	}
+ 
+ 	ret = tb_xdomain_enable_paths(xd, sdev->out_hopid,
+ 				     sdev->tx_ring.ring->hop,
+@@ -655,6 +669,9 @@
+ {
+ 	struct tb_xdomain *xd;
+ 
++	/* Disconnect may already have torn down this session. */
++	if (!sdev->tx_ring.ring)
++		return;
+ 	if (sdev->busy_poll) {
+ 		/*
+ 		 * When busy polling we must advance the ring ourselves
+@@ -783,7 +800,15 @@
+ 		if (sf->frame.eof == TBSTREAM_CLOSE) {
+ 			if (!nbytes) {
+ 				tbstream_dev_consume_rx(sdev);
+-				sdev->closed = true;
++				WRITE_ONCE(sdev->closed, true);
++			}
++			break;
++		} else if (sf->frame.flags &
++			   (RING_DESC_CRC_ERROR | RING_DESC_BUFFER_OVERRUN)) {
++			/* Return preceding good bytes before reporting the error. */
++			if (!nbytes) {
++				tbstream_dev_consume_rx(sdev);
++				ret = -EIO;
+ 			}
+ 			break;
+ 		}
+@@ -838,6 +863,8 @@
+ 
+ 	for (;;) {
+ 		tbstream_dev_poll_ring(sdev, &sdev->tx_ring);
++		/* A write-only application must still process peer CLOSE. */
++		tbstream_dev_poll_ring(sdev, &sdev->rx_ring);
+ 
+ 		ret = tbstream_dev_valid(sdev);
+ 		if (ret) {
+@@ -845,7 +872,12 @@
+ 			return ret;
+ 		}
+ 
+-		if (tbstream_dev_closed(sdev) || tbstream_dev_removed(sdev)) {
++		if (tbstream_dev_close_received(sdev)) {
++			mutex_unlock(&sdev->lock);
++			return -EPIPE;
++		}
++
++		if (tbstream_dev_removed(sdev)) {
+ 			mutex_unlock(&sdev->lock);
+ 			return -ENXIO;
+ 		}
+@@ -866,7 +898,7 @@
+ 			ret = wait_event_interruptible(sdev->wait,
+ 					tbstream_ring_available(&sdev->tx_ring) ||
+ 					tbstream_dev_valid(sdev) != 0 ||
+-					tbstream_dev_closed(sdev) ||
++					tbstream_dev_close_received(sdev) ||
+ 					tbstream_dev_removed(sdev));
+ 			if (ret)
+ 				return ret;
+@@ -917,10 +949,12 @@
+ 
+ 	poll_wait(file, &sdev->wait, wait);
+ 	guard(mutex)(&sdev->lock);
+-	if (tbstream_dev_valid(sdev) != 0) {
++	if (tbstream_dev_valid(sdev) != 0 || tbstream_dev_removed(sdev)) {
+ 		mask |= EPOLLHUP | EPOLLERR;
+ 	} else {
+-		if (tbstream_ring_available(&sdev->tx_ring))
++		if (tbstream_dev_close_received(sdev))
++			mask |= EPOLLHUP;
++		else if (tbstream_ring_available(&sdev->tx_ring))
+ 			mask |= EPOLLOUT | EPOLLWRNORM;
+ 		if (tbstream_ring_available(&sdev->rx_ring))
+ 			mask |= EPOLLIN | EPOLLRDNORM;
+@@ -945,9 +979,11 @@
+ 	 * unless this is opened in non-blocking mode.
+ 	 */
+ 	while ((ret = tbstream_dev_valid(sdev))) {
++		bool disconnected = sdev->disconnected;
++
+ 		mutex_unlock(&sdev->lock);
+ 
+-		if (ret != -ENXIO || (file->f_flags & O_NONBLOCK))
++		if (disconnected || ret != -ENXIO || (file->f_flags & O_NONBLOCK))
+ 			goto err_put;
+ 
+ 		ret = wait_event_interruptible(sdev->wait,
+@@ -969,12 +1005,13 @@
+ 
+ 	/* Only on first open we allocate rings and enable paths */
+ 	if (!sdev->users++) {
++		WRITE_ONCE(sdev->close_received, false);
++		WRITE_ONCE(sdev->closed, false);
+ 		ret = tbstream_dev_start(sdev);
+ 		if (ret) {
+ 			sdev->users--;
+ 			goto err_unlock;
+ 		}
+-		sdev->closed = false;
+ 	}
+ 
+ 	mutex_unlock(&sdev->lock);
+@@ -997,13 +1034,14 @@
+ 
+ 	mutex_lock(&sdev->lock);
+ 	if (--sdev->users == 0) {
+-		/*
+-		 * Send CLOSE tunneled packet to notify the other end
+-		 * that we are closing the file. We do this twice if the
+-		 * first one fails.
+-		 */
+-		tbstream_dev_send_close(sdev);
++		if (tbstream_dev_valid(sdev) == 0) {
++			tbstream_dev_poll_ring(sdev, &sdev->rx_ring);
++			if (!tbstream_dev_close_received(sdev) &&
++			    tbstream_dev_send_close(sdev))
++				pr_warn("could not queue CLOSE packet\n");
++		}
+ 		tbstream_dev_stop(sdev);
++		WRITE_ONCE(sdev->disconnected, false);
+ 	}
+ 	mutex_unlock(&sdev->lock);
+ 
+@@ -1462,6 +1500,10 @@
+ 		stream = sdev->stream;
+ 		if (!stream)
+ 			return;
++		if (sdev->users) {
++			WRITE_ONCE(sdev->disconnected, true);
++			tbstream_dev_stop(sdev);
++		}
+ 		sdev->stream = NULL;
+ 		xd = tb_service_parent(stream->svc);
+ 		if (sdev->out_hopid > 0)
+@@ -1732,55 +1774,29 @@
+ 	struct tbstream *stream = tb_service_get_drvdata(svc);
+ 	struct tbstream_group *sg;
+ 	struct tbstream_dev *sdev;
++	int ret = 0;
+ 
+ 	sg = tbstream_group_find(stream);
+ 	if (!sg)
+ 		return 0;
+ 
+-	list_for_each_entry_reverse(sdev, &sg->dev_list, list) {
+-		tbstream_dev_get(sdev);
+-		/* Stop the stream (if it was open) */
+-		if (sdev->users)
+-			tbstream_dev_stop(sdev);
+-		tbstream_dev_put(sdev);
++	/* USB4STREAM has no replay protocol for data discarded during sleep. */
++	scoped_guard(mutex, &sg->lock) {
++		list_for_each_entry(sdev, &sg->dev_list, list) {
++			guard(mutex)(&sdev->lock);
++			if (sdev->users) {
++				ret = -EBUSY;
++				break;
++			}
++		}
+ 	}
+ 
+ 	config_group_put(&sg->group);
+-	return 0;
+-}
+-
+-static int __maybe_unused tbstream_resume(struct device *dev)
+-{
+-	struct tb_service *svc = tb_to_service(dev);
+-	struct tbstream *stream = tb_service_get_drvdata(svc);
+-	struct tbstream_group *sg;
+-	struct tbstream_dev *sdev;
+-
+-	sg = tbstream_group_find(stream);
+-	if (!sg)
+-		return 0;
+-
+-	list_for_each_entry(sdev, &sg->dev_list, list) {
+-		tbstream_dev_get(sdev);
+-		if (sdev->users) {
+-			int ret;
+-
+-			ret = tbstream_dev_start(sdev);
+-			if (ret) {
+-				tbstream_dev_put(sdev);
+-				config_group_put(&sg->group);
+-				return ret;
+-			}
+-		}
+-		tbstream_dev_put(sdev);
+-	}
+-
+-	config_group_put(&sg->group);
+-	return 0;
++	return ret;
+ }
+ 
+ static const struct dev_pm_ops tbstream_pm_ops = {
+-	SET_SYSTEM_SLEEP_PM_OPS(tbstream_suspend, tbstream_resume)
++	SET_SYSTEM_SLEEP_PM_OPS(tbstream_suspend, NULL)
+ };
+ 
+ static const struct tb_service_id tbstream_ids[] = {
