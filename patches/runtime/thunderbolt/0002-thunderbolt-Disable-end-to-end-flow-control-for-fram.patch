@@ -1,0 +1,89 @@
+From 33ea4bbad62b21cc15f4bbb3dbf1f113f6ee747e Mon Sep 17 00:00:00 2001
+From: Dan <dan@todoolie.com>
+Date: Fri, 13 Nov 2026 14:49:27 -0500
+Subject: [PATCH] thunderbolt: Disable end-to-end flow control for frame rings
+ on Titan Ridge
+
+Cross-domain stream rings (thunderbolt_stream) request RING_FLAG_E2E
+unconditionally. On Titan Ridge (JHL7540, PCI device 0x15eb/0x15e8, as
+found on MacBook Pro 2021) the end-to-end credit exchange never
+completes: the first frames written after the link goes quiet are
+dropped silently, writes still report success, and one TX direction
+can stop delivering entirely until both controllers are reset. The
+Falcon Ridge QUIRK_E2E workaround (credit transfer on a reserved
+HopID) does not help this silicon - tested and it loses both
+directions completely.
+
+Clear RING_FLAG_E2E for frame rings on Titan Ridge NHIs via a new
+QUIRK_NO_FRAME_E2E. Only the stream driver creates frame rings, so no
+other ring type is affected.
+
+Measured on two MacBook Pro 16,1 2021 hosts, kernel
+7.3.3-300.fc45.x86_64, TB3 link over a passive cable: with E2E on, a
+single 32-byte frame written 40s after the device was opened arrived
+0 out of 1 times and 10 frames at 5s intervals arrived 0 out of 10;
+after the quirk, a long-running session delivered 93 of 93 frames
+(keepalive every 100ms plus sparse 5s frames) with no wedged
+direction.
+
+Signed-off-by: Dan <dan@todoolie.com>
+---
+ drivers/thunderbolt/nhi.c |  4 ++++
+ drivers/thunderbolt/nhi.h |  1 +
+ drivers/thunderbolt/pci.c | 13 +++++++++++++
+ 3 files changed, 18 insertions(+)
+
+diff --git a/drivers/thunderbolt/nhi.c b/drivers/thunderbolt/nhi.c
+index be18f7b..629fa6a 100644
+--- a/drivers/thunderbolt/nhi.c
++++ b/drivers/thunderbolt/nhi.c
+@@ -570,6 +570,10 @@ static struct tb_ring *tb_ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
+ 	ring->size = size;
+ 	ring->flags = flags;
+ 	ring->e2e_tx_hop = e2e_tx_hop;
++
++	if ((nhi->quirks & QUIRK_NO_FRAME_E2E) &&
++	    (ring->flags & RING_FLAG_FRAME))
++		ring->flags &= ~RING_FLAG_E2E;
+ 	ring->sof_mask = sof_mask;
+ 	ring->eof_mask = eof_mask;
+ 	ring->head = 0;
+diff --git a/drivers/thunderbolt/nhi.h b/drivers/thunderbolt/nhi.h
+index d488ead..ae52009 100644
+--- a/drivers/thunderbolt/nhi.h
++++ b/drivers/thunderbolt/nhi.h
+@@ -121,6 +121,7 @@ struct tb_nhi_ops {
+ /* Host interface quirks */
+ #define QUIRK_AUTO_CLEAR_INT	BIT(0)
+ #define QUIRK_E2E		BIT(1)
++#define QUIRK_NO_FRAME_E2E	BIT(2)
+ 
+ /*
+  * Minimal number of vectors when we use MSI-X. Two for control channel
+diff --git a/drivers/thunderbolt/pci.c b/drivers/thunderbolt/pci.c
+index 8462ccb..8648a2f 100644
+--- a/drivers/thunderbolt/pci.c
++++ b/drivers/thunderbolt/pci.c
+@@ -61,6 +61,19 @@ static void nhi_pci_check_quirks(struct tb_nhi_pci *nhi_pci)
+ 			 */
+ 			nhi->quirks |= QUIRK_E2E;
+ 			break;
++		case PCI_DEVICE_ID_INTEL_TITAN_RIDGE_2C_NHI:
++		case PCI_DEVICE_ID_INTEL_TITAN_RIDGE_4C_NHI:
++			/*
++			 * Titan Ridge loses Rx frames on cross-domain
++			 * frame rings when end-to-end flow control is
++			 * enabled: the credit exchange never completes
++			 * on this silicon, so small or sparse frames
++			 * are silently dropped and a direction can stop
++			 * delivering entirely. Do not use E2E on frame
++			 * rings on these controllers.
++			 */
++			nhi->quirks |= QUIRK_NO_FRAME_E2E;
++			break;
+ 		}
+ 	}
+ }
+-- 
+2.56.1
+
