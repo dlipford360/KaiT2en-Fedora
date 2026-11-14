@@ -1,0 +1,305 @@
+Subject: [PATCH] thunderbolt: stream: avoid blocking under the misc mutex
+
+misc_open() holds the global misc-device mutex while invoking the driver
+open method. USB4STREAM waits for a peer and activates DMA paths in its
+open method. This can block unrelated misc-device opens and registration,
+including registration from configfs while discovery needs configfs.
+
+Give streams a dedicated character-device range and class. Use
+cdev_device_add() and device references so the embedded cdev keeps its
+parent alive across open, configfs removal and failed registration.
+Reject opens racing configfs removal and wake partial-publication waiters
+if device registration fails.
+
+Device names remain /dev/tbstreamX. The sysfs/udev subsystem changes from
+misc to tbstream, and manually created nodes must not retain the old major.
+This removes the global misc lock from open, not underlying controller
+activation delays or per-stream locking failures.
+
+---
+diff --git a/drivers/thunderbolt/stream.c b/drivers/thunderbolt/stream.c
+--- a/drivers/thunderbolt/stream.c
++++ b/drivers/thunderbolt/stream.c
+@@ -10,12 +10,13 @@
+ #define pr_fmt(fmt) "tbstream: " fmt
+ 
+ #include <linux/delay.h>
++#include <linux/cdev.h>
++#include <linux/device.h>
+ #include <linux/configfs.h>
+ #include <linux/file.h>
+ #include <linux/fs.h>
+ #include <linux/idr.h>
+ #include <linux/ktime.h>
+-#include <linux/miscdevice.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/poll.h>
+@@ -123,8 +124,9 @@
+  * struct tbstream_dev - Stream character device
+  * @group: ConfigFS group for this device
+  * @stream: Pointer to the stream if it is attached (%NULL otherwise)
+- * @misc: Character device used for tunneling
+- * @kref: Reference count
++ * @dev: Device and lifetime reference for this stream
++ * @cdev: Character device used for tunneling
++ * @registered: Character device was successfully published
+  * @index: Unique identifier for the character device
+  * @in_hopid: In HopID
+  * @out_hopid: Out HopID
+@@ -145,8 +147,9 @@
+ struct tbstream_dev {
+ 	struct config_group group;
+ 	struct tbstream *stream;
+-	struct miscdevice misc;
+-	struct kref kref;
++	struct device dev;
++	struct cdev cdev;
++	bool registered;
+ 	int index;
+ 	int in_hopid;
+ 	int out_hopid;
+@@ -199,6 +202,10 @@
+ };
+ 
+ static DEFINE_IDA(tbstream_indices);
++static dev_t tbstream_devt;
++static const struct class tbstream_class = {
++	.name = "tbstream",
++};
+ 
+ /* Protects tbstream_list */
+ static DEFINE_MUTEX(tbstream_lock);
+@@ -206,9 +213,6 @@
+ 
+ /* Serializes tbstream_get()/put() */
+ static DEFINE_MUTEX(tbstream_kref_lock);
+-
+-/* Serializes tbstream_dev_get()/put() */
+-static DEFINE_MUTEX(tbstream_dev_kref_lock);
+ 
+ /* Stream property directory UUID: 3a1cb984-c4d9-4469-a277-ce2fdfd11f0d */
+ static const uuid_t tbstream_dir_uuid =
+@@ -289,9 +293,9 @@
+ 	return NULL;
+ }
+ 
+-static void tbstream_dev_release(struct kref *kref)
+-{
+-	struct tbstream_dev *sdev = container_of(kref, struct tbstream_dev, kref);
++static void tbstream_dev_release(struct device *dev)
++{
++	struct tbstream_dev *sdev = container_of(dev, struct tbstream_dev, dev);
+ 
+ 	if (sdev->stream) {
+ 		struct tb_xdomain *xd = tbstream_dev_xdomain(sdev);
+@@ -304,26 +308,18 @@
+ 		tbstream_put(sdev->stream);
+ 	}
+ 	ida_free(&tbstream_indices, sdev->index);
+-	kfree(sdev->misc.name);
+ 	kfree(sdev);
+ }
+ 
+ static inline void tbstream_dev_put(struct tbstream_dev *sdev)
+ {
+-	guard(mutex)(&tbstream_dev_kref_lock);
+-	kref_put(&sdev->kref, tbstream_dev_release);
++	put_device(&sdev->dev);
+ }
+ 
+ static inline struct tbstream_dev *tbstream_dev_get(struct tbstream_dev *sdev)
+ {
+-	guard(mutex)(&tbstream_dev_kref_lock);
+-	kref_get(&sdev->kref);
++	get_device(&sdev->dev);
+ 	return sdev;
+-}
+-
+-static inline struct tbstream_dev *to_tbstream_dev(struct miscdevice *misc)
+-{
+-	return container_of(misc, struct tbstream_dev, misc);
+ }
+ 
+ static inline int tbstream_dev_valid(const struct tbstream_dev *sdev)
+@@ -341,7 +337,7 @@
+ 
+ static inline bool tbstream_dev_removed(const struct tbstream_dev *sdev)
+ {
+-	return sdev->removed;
++	return READ_ONCE(sdev->removed);
+ }
+ 
+ static inline bool tbstream_dev_closed(const struct tbstream_dev *sdev)
+@@ -729,7 +725,7 @@
+ {
+ 	struct file *file = kiocb->ki_filp;
+ 	bool nowait = file->f_flags & O_NONBLOCK || kiocb->ki_flags & IOCB_NOWAIT;
+-	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	struct tbstream_dev *sdev = file->private_data;
+ 	size_t nbytes;
+ 	int ret;
+ 
+@@ -849,7 +845,7 @@
+ {
+ 	struct file *file = kiocb->ki_filp;
+ 	bool nowait = file->f_flags & O_NONBLOCK || kiocb->ki_flags & IOCB_NOWAIT;
+-	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	struct tbstream_dev *sdev = file->private_data;
+ 	size_t nbytes;
+ 	int ret;
+ 
+@@ -937,7 +933,7 @@
+ static __poll_t
+ tbstream_dev_fops_poll(struct file *file, struct poll_table_struct *wait)
+ {
+-	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	struct tbstream_dev *sdev = file->private_data;
+ 	__poll_t mask = 0;
+ 
+ 	/*
+@@ -964,14 +960,22 @@
+ 
+ static int tbstream_dev_fops_open(struct inode *inode, struct file *file)
+ {
+-	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	struct tbstream_dev *sdev = container_of(inode->i_cdev,
++						struct tbstream_dev, cdev);
+ 	int ret;
+ 
++	/* cdev_device_add() holds the parent device alive during open. */
+ 	tbstream_dev_get(sdev);
++	file->private_data = sdev;
+ 
+ 	if (mutex_lock_interruptible(&sdev->lock)) {
+ 		tbstream_dev_put(sdev);
+ 		return -ERESTARTSYS;
++	}
++
++	if (tbstream_dev_removed(sdev)) {
++		ret = -ENXIO;
++		goto err_unlock;
+ 	}
+ 
+ 	/*
+@@ -1030,7 +1034,7 @@
+ 
+ static int tbstream_dev_fops_release(struct inode *inode, struct file *file)
+ {
+-	struct tbstream_dev *sdev = to_tbstream_dev(file->private_data);
++	struct tbstream_dev *sdev = file->private_data;
+ 
+ 	mutex_lock(&sdev->lock);
+ 	if (--sdev->users == 0) {
+@@ -1414,7 +1418,8 @@
+ 	struct config_group *group = to_config_group(item);
+ 	struct tbstream_dev *sdev = tbstream_dev_from_group(group);
+ 
+-	misc_deregister(&sdev->misc);
++	if (sdev->registered)
++		cdev_device_del(&sdev->cdev, &sdev->dev);
+ 	tbstream_dev_put(sdev);
+ }
+ 
+@@ -1545,7 +1550,7 @@
+ 	if (!sdev)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	index = ida_alloc(&tbstream_indices, GFP_KERNEL);
++	index = ida_alloc_range(&tbstream_indices, 0, MINORMASK, GFP_KERNEL);
+ 	if (index < 0) {
+ 		kfree(sdev);
+ 		return ERR_PTR(index);
+@@ -1558,7 +1563,12 @@
+ 	init_waitqueue_head(&sdev->wait);
+ 	INIT_LIST_HEAD(&sdev->list);
+ 	/* This point forward tbstream_dev_put() must be used to release sdev */
+-	kref_init(&sdev->kref);
++	device_initialize(&sdev->dev);
++	sdev->dev.release = tbstream_dev_release;
++	sdev->dev.class = &tbstream_class;
++	sdev->dev.devt = MKDEV(MAJOR(tbstream_devt), index);
++	cdev_init(&sdev->cdev, &tbstream_dev_fops);
++	sdev->cdev.owner = THIS_MODULE;
+ 
+ 	config_group_init_type_name(&sdev->group, name, &tbstream_dev_type);
+ 
+@@ -1567,12 +1577,14 @@
+ 
+ 	tbstream_dev_attach_stream(sdev, sg);
+ 
+-	sdev->misc.name = kasprintf(GFP_KERNEL, "tbstream%d", index);
+-	sdev->misc.minor = MISC_DYNAMIC_MINOR;
+-	sdev->misc.fops = &tbstream_dev_fops;
+-
+-	ret = misc_register(&sdev->misc);
++	ret = dev_set_name(&sdev->dev, "tbstream%d", index);
++	if (!ret)
++		ret = cdev_device_add(&sdev->cdev, &sdev->dev);
+ 	if (ret) {
++		/* Even a failed cdev_device_add() can race an opener. */
++		scoped_guard(mutex, &sdev->lock)
++			WRITE_ONCE(sdev->removed, true);
++		wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
+ 		tbstream_dev_detach_stream(sdev);
+ 		scoped_guard(mutex, &sg->lock)
+ 			list_del(&sdev->list);
+@@ -1580,6 +1592,7 @@
+ 		config_group_put(&sdev->group);
+ 		return ERR_PTR(ret);
+ 	}
++	sdev->registered = true;
+ 
+ 	return &sdev->group;
+ }
+@@ -1594,7 +1607,8 @@
+ 	scoped_guard(mutex, &sg->lock)
+ 		list_del(&sdev->list);
+ 	/* Notify any task that the underlying group was removed  */
+-	sdev->removed = true;
++	scoped_guard(mutex, &sdev->lock)
++		WRITE_ONCE(sdev->removed, true);
+ 	wake_up_interruptible_poll(&sdev->wait, EPOLLHUP | EPOLLERR);
+ 	config_item_put(item);
+ }
+@@ -1820,9 +1834,18 @@
+ {
+ 	int ret;
+ 
++	ret = alloc_chrdev_region(&tbstream_devt, 0, MINORMASK + 1, "tbstream");
++	if (ret)
++		return ret;
++	ret = class_register(&tbstream_class);
++	if (ret)
++		goto err_unregister_chrdev;
++
+ 	tbstream_dir = tb_property_create_dir(&tbstream_dir_uuid);
+-	if (!tbstream_dir)
+-		return -ENOMEM;
++	if (!tbstream_dir) {
++		ret = -ENOMEM;
++		goto err_unregister_class;
++	}
+ 
+ 	tb_property_add_immediate(tbstream_dir, "prtcid", 1);
+ 	tb_property_add_immediate(tbstream_dir, "prtcvers", 1);
+@@ -1849,6 +1872,10 @@
+ 	tb_unregister_property_dir("stream", tbstream_dir);
+ err_free_dir:
+ 	tb_property_free_dir(tbstream_dir);
++err_unregister_class:
++	class_unregister(&tbstream_class);
++err_unregister_chrdev:
++	unregister_chrdev_region(tbstream_devt, MINORMASK + 1);
+ 	return ret;
+ }
+ module_init(tbstream_init);
+@@ -1859,6 +1886,8 @@
+ 	tb_configfs_unregister_group(&tbstream_group);
+ 	tb_unregister_property_dir("stream", tbstream_dir);
+ 	tb_property_free_dir(tbstream_dir);
++	class_unregister(&tbstream_class);
++	unregister_chrdev_region(tbstream_devt, MINORMASK + 1);
+ 	ida_destroy(&tbstream_indices);
+ }
+ module_exit(tbstream_exit);

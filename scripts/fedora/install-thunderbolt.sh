@@ -199,7 +199,7 @@ else
 fi
 
 for patch_file in "${PATCH_FILES[@]}"; do
-	if [[ ${patch_file##*/} == 0002-thunderbolt-stream-preserve-session-integrity.patch ]] &&
+	if [[ ${patch_file##*/} == *-thunderbolt-stream-*.patch ]] &&
 		((stream_enabled == 0)); then
 		continue
 	fi

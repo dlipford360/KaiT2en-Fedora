@@ -1,2 +1,3 @@
 0001-thunderbolt-add-Titan-Ridge-and-Ice-Lake-RTD3-on-Apple-T2-Macs.patch
 0002-thunderbolt-stream-preserve-session-integrity.patch
+0003-thunderbolt-stream-use-dedicated-character-devices.patch
